@@ -1,59 +1,113 @@
-from telethon.sync import TelegramClient, events
-from telethon.tl.types import PeerChannel
+
 import asyncio
+import re
+import random
+import logging
+from collections import defaultdict
+from telethon import TelegramClient, events
+from telethon.tl.types import MessageMediaDocument, DocumentAttributeFilename
 
-# Настройки API Telegram (получить на my.telegram.org)
-API_ID = 1234567  # Замените на ваш API_ID
-API_HASH = 'ваш_api_hash'  # Замените на ваш API_HASH
+# === НАСТРОЙКИ ===
+api_id = 12345678  # Замените на ваш API ID
+api_hash = 'cadcdasd12312eawcdawd21dsaca'  # Замените на ваш API Hash
+session_name = 'session_name'
+# Логирование
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-# Сессионный файл (для авторизации)
-SESSION_NAME = 'session_name'
-
-# Настройки каналов (формат: { "ID_исходного_канала": "ID_основного_канала" })
-SOURCE_TO_TARGET = {
-    -1001234567890: -1001111111111,  # Из канала A → в канал X
-    -1009876543210: -1002222222222,   # Из канала B → в канал Y
+# Основные пересылы
+main_channels = {
+    -1000000000000: -2000000000000, 
+    -3000000000000: -4000000000000,
 }
 
-# Каналы для ключевых слов (формат: { "ключевое_слово": (ID_канала, [ID_исходных_каналов]) })
-KEYWORD_CHANNELS = {
-    "срочно": (-1003333333333, []),       # Для всех каналов
-    "важно": (-1004444444444, []),        # Для всех каналов
-    "крипто": (-1005555555555, [-1001234567890]),  # Только для канала A
-    "игры": (-1006666666666, [-1009876543210]),    # Только для канала B
+# по ключевым словам 
+keyword_channels = { 
+    ("слово", "словечко", "слова"): -100000200000,
+    ("азбука"): -1000000200000,
 }
 
-# Задержка перед пересылкой (в секундах)
-DELAY_BEFORE_FORWARD = 5  # 5 секунд
+compiled_keywords = [
+    (re.compile(rf'\b({"|".join(words)})\b', flags=re.IGNORECASE), channel)
+    for words, channel in keyword_channels.items()
+]
 
-# Создаем клиент Telegram
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(session_name, api_id, api_hash)
 
-@client.on(events.NewMessage)
-async def handler(event):
-    message = event.message
-    message_text = message.text.lower() if message.text else ""
-    chat_id = event.chat_id
+# Для хранения групп сообщений (альбомов)
+group_buffer = defaultdict(list)
+group_timers = {}
 
-    # Проверяем, что сообщение из нужного нам канала
-    if chat_id in SOURCE_TO_TARGET:
-        # Добавляем задержку перед пересылкой
-        await asyncio.sleep(DELAY_BEFORE_FORWARD)
+def extract_text_and_filenames(messages):
+    text_parts = []
+    filenames = []
 
-        # Пересылаем в основной канал
-        target_channel = SOURCE_TO_TARGET[chat_id]
-        await client.send_message(target_channel, message)
+    for msg in messages:
+        if msg.message:
+            text_parts.append(msg.message)
 
-        # Проверяем ключевые слова
-        for keyword, (channel_id, source_channels) in KEYWORD_CHANNELS.items():
-            # Если ключевое слово найдено и (канал не указан или сообщение из нужного канала)
-            if keyword in message_text and (not source_channels or chat_id in source_channels):
-                await client.send_message(channel_id, message)
+        if msg.media and isinstance(msg.media, MessageMediaDocument):
+            for attr in msg.media.document.attributes:
+                if isinstance(attr, DocumentAttributeFilename):
+                    filenames.append(attr.file_name)
+
+    return " ".join(text_parts + filenames)
+
+async def process_and_forward(messages, source_id):
+    dest_id = main_channels.get(source_id)
+    if not dest_id:
+        return
+
+    # Основной пересыл
+    try:
+        await client.forward_messages(dest_id, messages)
+        logging.info(f"📦 Основной пересыл: {source_id} → {dest_id}")
+    except Exception as e:
+        logging.error(f"❌ Ошибка в основной пересылке ({dest_id}): {e}")
+
+    # Фильтрация по ключам
+    content = extract_text_and_filenames(messages)
+    found_channels = set()
+
+    for regex, channel_id in compiled_keywords:
+        if regex.search(content):
+            if channel_id not in found_channels:
+                try:
+                    await client.forward_messages(channel_id, messages)
+                    logging.info(f"🔑 Найден ключ {regex.pattern} → в {channel_id}")
+                    found_channels.add(channel_id)
+                except Exception as e:
+                    logging.error(f"❌ Ошибка пересылки в ключевой канал ({channel_id}): {e}")
+
+    await asyncio.sleep(random.uniform(3, 5))
+
+async def flush_album(grouped_id, source_id):
+    messages = group_buffer.pop(grouped_id, [])
+    group_timers.pop(grouped_id, None)
+    if messages:
+        await process_and_forward(messages, source_id)
+
+@client.on(events.NewMessage(chats=list(main_channels.keys())))
+async def message_handler(event):
+    msg = event.message
+    grouped_id = getattr(msg, 'grouped_id', None)
+    source_id = event.chat_id
+
+    if grouped_id:
+        group_buffer[grouped_id].append(msg)
+
+        # Обновляем/создаём таймер на 1.5 сек — после прихода последнего сообщения в альбоме
+        if group_timers.get(grouped_id):
+            group_timers[grouped_id].cancel()
+
+        group_timers[grouped_id] = asyncio.get_event_loop().call_later(
+            1.5, lambda: asyncio.create_task(flush_album(grouped_id, source_id))
+        )
+    else:
+        await process_and_forward([msg], source_id)
 
 async def main():
     await client.start()
-    print("Бот запущен и слушает каналы...")
-    print("Исходные каналы:", SOURCE_TO_TARGET.keys())
+    logging.info("✅ Скрипт запущен и ждёт сообщения...")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
